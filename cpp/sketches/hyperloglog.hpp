@@ -158,9 +158,20 @@ public:
                 result.registers_[i] = mx;
             }
         } else {
-            // Upgrade: copy old registers, rest remain 0
-            std::copy(registers_.begin(), registers_.end(),
-                      result.registers_.begin());
+            // Upgrade: k extra bits move from remainder into bucket index
+            const int delta_p = new_precision - precision_;
+            const uint32_t factor = new_m / m_;
+            for (uint32_t i = 0; i < m_; ++i) {
+                const uint8_t val = registers_[i];
+                const uint32_t base = i * factor;
+                if (val > static_cast<uint8_t>(delta_p)) {
+                    const uint8_t shifted = static_cast<uint8_t>(val - delta_p);
+                    for (uint32_t j = 0; j < factor; ++j)
+                        result.registers_[base + j] = shifted;
+                } else if (val > 0) {
+                    result.registers_[base] = 1;
+                }
+            }
         }
         return result;
     }

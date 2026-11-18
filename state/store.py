@@ -10,6 +10,7 @@ Responsible for:
 import json
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import redis
@@ -22,10 +23,11 @@ REDIS_PORT  = int(os.getenv("REDIS_PORT", "6379"))
 
 # Redis key patterns
 # IMPORTANT: These must match cpp/worker/redis_reporter.hpp exactly.
-_METRICS_KEY   = "worker:{worker_id}:metrics"
-_CTRL_LOG_KEY  = "btp:controller:log"
-_WORKERS_SET   = "btp:workers"            # set of known worker IDs
-_QUERY_LOG_KEY = "btp:router:queries"     # recent query routing decisions
+_METRICS_KEY    = "worker:{worker_id}:metrics"
+_CTRL_LOG_KEY   = "btp:controller:log"
+_CTRL_STATS_KEY = "btp:controller:stats"
+_WORKERS_SET    = "btp:workers"            # set of known worker IDs
+_QUERY_LOG_KEY  = "btp:router:queries"     # recent query routing decisions
 
 
 class StateStore:
@@ -138,10 +140,94 @@ class StateStore:
         return [json.loads(e) for e in entries]
 
     # ------------------------------------------------------------------
-    # Controller pub/sub (sends commands to workers)
+    # Controller pub/sub & RPC (sends commands / point queries to workers)
     # ------------------------------------------------------------------
 
     def send_command(self, worker_id: str, command: dict) -> None:
         """Publish a command dict to the worker's command channel."""
         channel = f"ctrl:commands:{worker_id}"
         self.redis.publish(channel, json.dumps(command))
+
+    def query_worker_frequency(
+        self,
+        worker_id: str,
+        key: str,
+        timeout_sec: float = 1.0,
+    ) -> Optional[dict]:
+        """
+        Execute a live point-frequency RPC against a specific worker's CMS
+        using Redis pub/sub request + ephemeral list reply.
+        """
+        reply_key = f"rpc:freq:{uuid.uuid4().hex}"
+        self.send_command(worker_id, {
+            "action": "query_frequency",
+            "key": key,
+            "reply_key": reply_key,
+        })
+        result = self.redis.blpop(reply_key, timeout=max(1, int(round(timeout_sec))))
+        if not result:
+            return None
+        _, raw = result
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def query_worker_registers(
+        self,
+        worker_id: str,
+        timeout_sec: float = 1.0,
+    ) -> Optional[dict]:
+        """
+        Execute an RPC to retrieve a worker's raw HyperLogLog registers
+        for distributed Monoid maximum merge.
+        """
+        reply_key = f"rpc:hll:{uuid.uuid4().hex}"
+        self.send_command(worker_id, {
+            "action": "query_cardinality_registers",
+            "reply_key": reply_key,
+        })
+        result = self.redis.blpop(reply_key, timeout=max(1, int(round(timeout_sec))))
+        if not result:
+            return None
+        _, raw = result
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    def query_worker_heavy_hitters_partial(
+        self,
+        worker_id: str,
+        timeout_sec: float = 1.0,
+    ) -> Optional[dict]:
+        """
+        Execute an RPC to retrieve a worker's partial Misra-Gries candidate map
+        for distributed Monoid merge.
+        """
+        reply_key = f"rpc:mg:{uuid.uuid4().hex}"
+        self.send_command(worker_id, {
+            "action": "query_heavy_hitters_partial",
+            "reply_key": reply_key,
+        })
+        result = self.redis.blpop(reply_key, timeout=max(1, int(round(timeout_sec))))
+        if not result:
+            return None
+        _, raw = result
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+
+    # ------------------------------------------------------------------
+    # Controller telemetry (ML / RL stats)
+    # ------------------------------------------------------------------
+
+    def save_controller_stats(self, stats: dict) -> None:
+        """Persist live controller telemetry (mode, epsilon, rewards, Q-table summary)."""
+        self.redis.set(_CTRL_STATS_KEY, json.dumps(stats), ex=300)
+
+    def get_controller_stats(self) -> Optional[dict]:
+        """Return latest controller telemetry, or None if unavailable."""
+        raw = self.redis.get(_CTRL_STATS_KEY)
+        return json.loads(raw) if raw else None

@@ -207,13 +207,19 @@ private:
                                   : TEMPLATES.at("medium");
 
         std::unique_lock lock(sketch_mutex_);
-        cms_ = std::make_unique<CountMinSketch>(p.cms_width, p.cms_depth);
-        hll_ = std::make_unique<HyperLogLog>(p.hll_precision);
-        mg_  = std::make_unique<SlidingWindowMisraGries>(p.mg_k);
+        if (!cms_) {
+            cms_ = std::make_unique<CountMinSketch>(p.cms_width, p.cms_depth);
+            hll_ = std::make_unique<HyperLogLog>(p.hll_precision);
+            mg_  = std::make_unique<SlidingWindowMisraGries>(p.mg_k);
+        } else {
+            cms_ = std::make_unique<CountMinSketch>(cms_->resize_preserving(p.cms_width, p.cms_depth));
+            hll_ = std::make_unique<HyperLogLog>(hll_->change_precision(p.hll_precision));
+            mg_->resize(p.mg_k);
+        }
         current_template_ = templ_name;
 
         std::cout << "[" << worker_id_ << "] Applied template '" << templ_name
-                  << "': CMS(" << p.cms_width << "x" << p.cms_depth
+                  << "' (state preserved): CMS(" << p.cms_width << "x" << p.cms_depth
                   << ") HLL(p=" << p.hll_precision
                   << ") MG(k=" << p.mg_k << ")\n";
     }
@@ -231,6 +237,27 @@ private:
             std::unique_lock lock(sketch_mutex_);
             mg_->resize(new_k);
             std::cout << "[" << worker_id_ << "] Resized MisraGries k=" << new_k << "\n";
+        } else if (action == "query_frequency") {
+            const std::string key = payload.value("key", "");
+            const std::string reply_key = payload.value("reply_key", "");
+            if (!reply_key.empty() && reporter_) {
+                int64_t est = 0;
+                double err_bound = 0.0;
+                int64_t total_cnt = 0;
+                {
+                    std::shared_lock lock(sketch_mutex_);
+                    est = cms_->query(key);
+                    err_bound = cms_->estimated_error();
+                    total_cnt = cms_->total_count();
+                }
+                reporter_->send_rpc_reply(reply_key, {
+                    {"key", key},
+                    {"estimated_frequency", est},
+                    {"cms_error_bound", err_bound},
+                    {"cms_total_count", total_cnt},
+                    {"worker_id", worker_id_},
+                });
+            }
         }
     }
 

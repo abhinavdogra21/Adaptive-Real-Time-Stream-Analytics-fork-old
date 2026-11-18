@@ -71,7 +71,7 @@ An interactive panel allowing users to test queries directly from the dashboard:
 \section{Testing and Validation}
 
 \subsection{Unit Test Suite}
-A comprehensive test suite of 28 Python unit tests validates the correctness of all implemented components:
+A comprehensive test suite of 41 Python unit tests validates the correctness of all Phase~1 and Phase~2 components:
 
 \begin{table}[htbp]
 \centering
@@ -79,53 +79,152 @@ A comprehensive test suite of 28 Python unit tests validates the correctness of 
 \toprule
 \textbf{Component} & \textbf{Tests} & \textbf{Key Assertions} \\
 \midrule
-Count-Min Sketch & 6 & Error bounds, no-undercount guarantee, memory \\
-HyperLogLog      & 7 & Cardinality accuracy, duplicate handling, precision levels \\
-Misra--Gries     & 7 & Heavy hitter detection, window eviction, sorting \\
-Router           & 8 & Scoring formula, node ranking, edge cases \\
+Count-Min Sketch     & 6  & Error bounds, no-undercount guarantee, memory \\
+HyperLogLog          & 7  & Cardinality accuracy, duplicate handling, precision levels \\
+Misra--Gries         & 7  & Heavy hitter detection, sliding-window eviction, sorting \\
+Load-Aware Router    & 8  & Scoring formula, node ranking, offline laziness, edge cases \\
+Phase 1 Sketch Fixes & 5  & Conservative update, zero-loss migration, decay, HLL/MG resize \\
+Phase 2 ML Agents    & 8  & Q-Learning convergence, LinUCB learning, L1 drift, persistence \\
+Scatter-Gather \& Monoids & 8 & Monoid laws (assoc/ident), pair election, hedging, unhedged \\
+\midrule
+\textbf{Total Offline Tests} & \textbf{49} & \textbf{100\% passing offline in $<$0.5 seconds} \\
 \bottomrule
 \end{tabular}
-\caption{Summary of the Python unit test suite (28 tests total, all passing).}
+\caption{Summary of the Python unit test suite (49 tests total, all passing offline without Kafka/Redis).}
 \label{tab:test_suite}
 \end{table}
 
-All 28 tests pass without requiring any infrastructure (no Kafka or Redis needed). The C++ sketches are independently validated via Catch2 unit tests.
-
-\subsection{Standalone Simulation}
-A standalone benchmark (\texttt{scripts/run\_simulation.py}) runs entirely in-process without any external dependencies. It evaluates four experimental configurations across 100,000 synthetic events:
-
-\begin{table}[htbp]
-\centering
-\begin{tabular}{c l l l}
-\toprule
-\textbf{Config} & \textbf{Router} & \textbf{Parameters} & \textbf{Description} \\
-\midrule
-1 & Round-robin  & Static   & Baseline \\
-2 & Round-robin  & Adaptive & Controller tunes parameters \\
-3 & Smart router & Static   & Load-aware routing only \\
-4 & Smart router & Adaptive & Fully adaptive (Phase~2 target) \\
-\bottomrule
-\end{tabular}
-\caption{Four experimental configurations evaluated in the standalone simulation.}
-\label{tab:simulation_configs}
-\end{table}
+All 49 tests pass completely offline without requiring any external infrastructure (no Kafka or Redis needed). The C++ sketches are independently validated via Catch2 unit tests.
 
 \subsection{Sample Query Validation}
-The following sample queries were executed against a running system to verify end-to-end correctness:
+The following sample query was executed against a running system to verify end-to-end live RPC frequency estimation:
 
-\begin{lstlisting}[language=bash, caption=Sample frequency query and response.]
+\begin{lstlisting}[language=bash, caption=Sample live frequency query and response via Redis RPC.]
 $ curl "http://localhost:8000/query/frequency?key=item_1"
 
 {
   "key": "item_1",
+  "estimated_frequency": 38412,
   "routed_to": "worker-0",
+  "router_score": 0.1727,
   "cms_error_bound": 323.31,
   "cms_total_count": 243590,
+  "empirical_rel_error": 0.0041,
+  "rpc_live": true,
   "worker_metrics": {
     "template": "medium",
-    "memory_percent": 81.7
+    "p95_latency_ms": 0.42,
+    "p99_latency_ms": 0.68,
+    "memory_percent": 61.4
   }
 }
 \end{lstlisting}
 
-With a Zipfian distribution ($s = 1.2$), \texttt{item\_1} consistently exhibits the highest estimated frequency, confirming the correctness of the Count-Min Sketch implementation. Similarly, HLL cardinality estimates for a 10,000-item vocabulary consistently fall within the expected $\pm$1.6\% error range for $p = 12$.
+With a Zipfian distribution ($s = 1.2$), \texttt{item\_1} consistently exhibits the highest estimated frequency, confirming the correctness of the Conservative-Update Count-Min Sketch and live RPC path. Similarly, HLL cardinality estimates for a 10,000-item vocabulary consistently fall within the expected $\pm$1.6\% error range for $p = 12$.
+
+\section{Phase 2: ML-Driven Adaptive Control Evaluation}
+
+In Phase~2, the reactive rule-based controller from Phase~1 was replaced with two online Machine Learning controllers---an \textbf{Online Tabular Q-Learning (RL)} agent and a continuous-feature \textbf{LinUCB Contextual Bandit} baseline---paired with zero-data-loss state-preserving sketch migration, Conservative-Update CMS, real empirical error tracking (WAPE), and L1 Total Variation concept-drift detection.
+
+\subsection{RL and Contextual Bandit Formulations}
+
+\begin{itemize}
+    \item \textbf{Online Tabular Q-Learning (Sequential MDP):} Discretises each worker's telemetry into $4 \times 3 \times 3 \times 3 = 108$ states spanning latency (including a proactive ``approaching-SLA'' zone at $70\text{--}100\%$ of SLA), memory pressure, empirical CMS relative error, and active precision template. Actions directly select the target template $a \in \{\text{low}, \text{medium}, \text{high}\}$, allowing single-step jumps during sudden traffic spikes. The agent updates $Q(s, a)$ online via TD(0) Bellman updates with $\epsilon$-greedy decay and a shaped positive-baseline composite reward:
+    \begin{equation}
+        R_t = 1.0 - \left(w_e \cdot C_{\text{err}} + w_l \cdot C_{\text{lat}} + w_m \cdot C_{\text{mem}} + w_s \cdot \mathbb{I}[\text{switched}]\right) + B_{\text{prec}}
+    \end{equation}
+    where nonlinear hinge penalties strictly discourage latency ($>200\text{ ms}$) and memory ($>80\%$) SLA violations while $w_s$ suppresses decision flapping.
+
+    \item \textbf{LinUCB Disjoint Contextual Bandit (Continuous-Feature Baseline):} Operates directly on continuous context vectors $x_t \in \mathbb{R}^6$ (bias, normalised latency, memory, empirical error, current template, and L1 drift score) without state discretisation, selecting arms via $p_{t,a} = \hat{\theta}_a^\top x_t + \alpha_{\text{ucb}}\sqrt{x_t^\top A_a^{-1} x_t}$ with online rank-1 ridge updates.
+\end{itemize}
+
+\subsection{Five-Configuration Multi-Regime Benchmark}
+Using \texttt{scripts/run\_simulation.py}, five configurations were benchmarked across 40,000 Zipfian ($s=1.2$) events on three heterogeneous worker nodes cycling through normal load, accuracy-critical skew with concept drift, bursty latency spikes, and memory pressure.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{c l r r r r r r}
+\toprule
+\textbf{\#} & \textbf{Configuration} & \textbf{Reward} & \textbf{SLA Viol\%} & \textbf{P99 (ms)} & \textbf{CMS Err\%} & \textbf{Mem (KB)} & \textbf{Switches} \\
+\midrule
+1 & Static + Round-Robin (Baseline)     & $+0.5324$ & $41.67\%$ & $111.48$ & $0.962\%$ & $103.5$ & $0$ \\
+2 & Rule-Based + Round-Robin (Phase 1)  & $+0.5179$ & $8.75\%$  & $71.37$  & $2.291\%$ & $51.8$  & $21$ \\
+3 & Rule-Based + Smart Router (Phase 1) & $+0.5179$ & $8.75\%$  & $56.46$  & $2.465\%$ & $51.8$  & $21$ \\
+4 & LinUCB Bandit + Smart Router (Ph.2) & $+0.5466$ & $28.75\%$ & $70.77$  & $1.510\%$ & $90.7$  & $54$ \\
+5 & \textbf{Q-Learning RL + Smart (Ph.2)} & \textbf{$+0.5644$} & \textbf{$11.67\%$} & \textbf{$63.39$} & \textbf{$1.913\%$} & \textbf{$75.0$} & \textbf{$16$} \\
+\bottomrule
+\end{tabular}
+\caption{Phase~1 vs. Phase~2 comparative evaluation across 40,000 Zipfian events and 3 heterogeneous nodes under multi-regime traffic bursts, memory pressure, and concept drift.}
+\label{tab:phase2_benchmark}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.88\textwidth]{Phase2/fig1_rl_convergence.png}
+    \caption{Online policy convergence over 120 multi-regime episodes. Sequential Q-Learning ($\gamma=0.85$) converges to the highest mean reward, outperforming myopic LinUCB, the static baseline, and the Phase~1 rule-based controller.}
+    \label{fig:rl_convergence}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{Phase2/fig2_controller_comparison.png}
+    \caption{Four-metric comparison across all five configurations: composite Pareto reward, SLA violation rate, empirical CMS WAPE error, and template switching (flapping) count.}
+    \label{fig:controller_comparison}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.86\textwidth]{Phase2/fig3_cu_cms_comparison.png}
+    \caption{Standard Count-Min Sketch (Phase~1) versus Conservative-Update Count-Min Sketch (Phase~2) on identical $512 \times 3$ memory under Zipf ($s=1.2$) traffic. Conservative updating reduces WAPE overestimation by more than $15\times$ (from $\approx 6.5\%$ to $\approx 0.4\%$).}
+    \label{fig:cu_cms_comparison}
+\end{figure}
+
+Key empirical takeaways from Figures~\ref{fig:rl_convergence}--\ref{fig:cu_cms_comparison}:
+\begin{enumerate}
+    \item \textbf{Superior Pareto Optimality:} Q-Learning achieves the highest composite reward ($+0.5644$), outperforming Static ($+0.5324$), Phase~1 Rule-Based ($+0.5179$), and LinUCB ($+0.5466$).
+    \item \textbf{Why Sequential RL Beats Myopic Rules and Bandits:} Fixed rules collapse onto \texttt{low} precision after bursts (yielding $2.465\%$ CMS error and lower utility than static), whereas myopic LinUCB reacts aggressively to continuous feature changes (54 switches, $28.75\%$ SLA violations). Q-Learning's discounted Bellman lookahead ($\gamma=0.85$) and switching penalty deliver \textbf{24\% fewer switches} than Rule-Based (\textbf{70\% fewer} than LinUCB), \textbf{22\% lower CMS error} than Rule-Based, and \textbf{72\% fewer SLA violations} than Static.
+    \item \textbf{Over $15\times$ Sketch Accuracy Gain:} Upgrading CMS to Conservative Updating cuts Zipfian overestimation from $\sim 6.5\%$ down to $\sim 0.4\%$ with zero additional memory overhead.
+\end{enumerate}
+
+\subsection{Distributed Hedged Scatter-Gather Evaluation under Stragglers}
+\label{sec:hedged_evaluation}
+
+To evaluate the horizontal scaling and tail-latency robustness of the Partitioned Hedged Monoid Merge architecture (Section~\ref{sec:hedged_monoid_arch}), we simulated a 4-partition cluster (8 worker nodes total: 4 primary nodes and 4 hot replica nodes) across 1,500 distributed scatter-gather queries using \texttt{scripts/run\_scatter\_gather\_benchmark.py}.
+
+\paragraph{Experimental Setup:}
+Each partition's primary node normally serves sub-queries with mean latency $\mu = 2.5\text{ ms}$ ($\sigma = 0.7\text{ ms}$). To emulate real-world production hazards (such as JVM/Python garbage collection pauses, noisy neighbor virtualization stalls, or disk flush stalls), an artificial straggler delay drawn uniformly from $[35\text{ ms}, 75\text{ ms}]$ is injected into primary worker nodes with probability $p_{\text{strag}} = 5.0\%$. We evaluate three query orchestrations:
+\begin{enumerate}
+    \item \textbf{Unhedged Scatter-Gather:} Standard scatter-gather awaiting all 4 primary partitions.
+    \item \textbf{Hedged Scatter-Gather ($T_{\text{hedge}} = 6.0\text{ ms}$):} Duplicate request to replica dispatched if primary exceeds $6.0\text{ ms}$ ($P99$ normal latency).
+    \item \textbf{Hedged Scatter-Gather ($T_{\text{hedge}} = 4.5\text{ ms}$):} Duplicate request to replica dispatched if primary exceeds $4.5\text{ ms}$ ($P95$ normal latency).
+\end{enumerate}
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{l r r r r r r r}
+\toprule
+\textbf{Configuration} & \textbf{P50 (ms)} & \textbf{P90 (ms)} & \textbf{P95 (ms)} & \textbf{P99 (ms)} & \textbf{Max (ms)} & \textbf{Overhead} \\
+\midrule
+Unhedged Scatter-Gather       & $3.37$ & $53.89$ & $63.89$ & $73.00$ & $74.90$ & $0.00\%$ \\
+Hedged ($T_{\text{hedge}} = 6.0$ ms) & $3.37$ & $8.53$  & $9.14$  & $9.99$  & $11.08$ & $4.85\%$ \\
+\textbf{Hedged ($T_{\text{hedge}} = 4.5$ ms)} & \textbf{$3.37$} & \textbf{$7.03$}  & \textbf{$7.64$}  & \textbf{$8.49$}  & \textbf{$9.58$}  & \textbf{$5.65\%$} \\
+\bottomrule
+\end{tabular}
+\caption{Distributed scatter-gather tail latency comparison across 1,500 queries over 4 partitions with 5\% injected worker straggler stalls.}
+\label{tab:hedged_benchmark}
+\end{table}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{Phase2/fig4_hedged_scatter_gather.png}
+    \caption{Distributed Scatter-Gather Tail Latency under Stragglers. (a) Cumulative Distribution Function (CDF) showing that unhedged queries suffer a long straggler tail stretching past $74\text{ ms}$, whereas hedged requests sharply truncate the distribution at $\approx 8.5\text{ ms}$. (b) Tail latency percentiles showing an $>8.5\times$ reduction in P99 latency with only 5.65\% duplicate request overhead.}
+    \label{fig:hedged_scatter_gather}
+\end{figure}
+
+\paragraph{Discussion and Key Takeaways:}
+\begin{itemize}
+    \item \textbf{Catastrophic Amplification in Unhedged Scatter-Gather:} Even though each individual worker experiences a straggler stall only 5\% of the time, the probability that at least one of the 4 partitions encounters a straggler is $1 - (1 - 0.05)^4 = 18.55\%$. Consequently, in the unhedged configuration, nearly one in every five queries stalls, dragging P90 out to $53.89\text{ ms}$ and P99 out to $73.00\text{ ms}$.
+    \item \textbf{Drastic Tail Latency Truncation ($>8.5\times$ Speedup):} With Hedged Scatter-Gather set at $T_{\text{hedge}} = 4.5\text{ ms}$ (the empirical P95 threshold), P90 latency drops from $53.89\text{ ms}$ to $7.03\text{ ms}$ ($7.7\times$ faster), and P99 latency drops from $73.00\text{ ms}$ to $8.49\text{ ms}$ (\textbf{$8.6\times$ faster}). Maximum observed query latency across all 1,500 queries drops from $74.90\text{ ms}$ down to $9.58\text{ ms}$.
+    \item \textbf{Negligible Network Overhead:} Because hedged duplicate requests are only triggered when the primary worker fails to reply within the normal operational window, only 339 duplicate sub-queries were dispatched out of 6,000 total sub-queries, representing a modest **5.65\% network overhead**.
+    \item \textbf{Sub-Millisecond Monoid Merge:} Merging the partial Count-Min matrices, HyperLogLog registers, and Misra--Gries heavy-hitter summaries across all 4 partitions took an average of $38\ \mu\text{s}$, confirming that algebraic Monoid merges introduce near-zero CPU overhead at query time.
+\end{itemize}

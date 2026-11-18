@@ -48,11 +48,20 @@ public:
     // Core operations
     // -----------------------------------------------------------------------
 
-    /** Insert key (or increment by count). O(depth) time. */
+    /** Insert key using Conservative Updating (suppresses Zipfian inflation). O(depth) time. */
     void update(std::string_view key, int64_t count = 1) noexcept {
+        if (count <= 0) return;
+        // Compute current minimum across all rows first
+        std::vector<uint64_t> cols(depth_);
+        int64_t min_val = INT64_MAX;
         for (uint32_t row = 0; row < depth_; ++row) {
-            const uint64_t col = hash(key, row);
-            table_[row * width_ + col] += count;
+            cols[row] = hash(key, row);
+            min_val = std::min(min_val, table_[row * width_ + cols[row]]);
+        }
+        const int64_t target = min_val + count;
+        for (uint32_t row = 0; row < depth_; ++row) {
+            int64_t& cell = table_[row * width_ + cols[row]];
+            if (cell < target) cell = target;
         }
         total_count_ += count;
     }
@@ -106,8 +115,21 @@ public:
 
     /**
      * Return a NEW CountMinSketch with updated parameters.
-     * The old sketch is discarded; the worker re-warms from the stream.
+     * On power-of-2 width downgrade, folds buckets modularly with zero data loss.
      */
+    [[nodiscard]] CountMinSketch resize_preserving(uint32_t new_width, uint32_t new_depth) const {
+        CountMinSketch next(new_width, new_depth);
+        if (new_width <= width_ && (width_ % new_width == 0) && new_depth <= depth_) {
+            for (uint32_t r = 0; r < new_depth; ++r) {
+                for (uint32_t c = 0; c < width_; ++c) {
+                    next.table_[r * new_width + (c % new_width)] += table_[r * width_ + c];
+                }
+            }
+            next.total_count_ = total_count_;
+        }
+        return next;
+    }
+
     [[nodiscard]] static CountMinSketch resize(uint32_t new_width, uint32_t new_depth) {
         return CountMinSketch(new_width, new_depth);
     }

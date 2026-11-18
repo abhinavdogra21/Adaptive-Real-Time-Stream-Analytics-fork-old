@@ -176,22 +176,15 @@ async function updateLiveAnswers(cluster) {
     setText('ansMgShare', 'Share of window: —');
   }
 
-  // 3. Count-Min Sketch (Live Query)
+  // 3. Count-Min Sketch (Live RPC Point Query)
   if (topItem) {
     try {
       const resp = await fetch(`/query/frequency?key=${encodeURIComponent(topItem)}`);
       if (resp.ok) {
         const data = await resp.json();
-        // The API returns cms_error_bound and cms_total_count.
-        // The actual frequency estimate isn't in the root of the cluster metrics, it requires this query!
-        // To approximate the live frequency from the API, we use the fact that MG count is a lower bound, 
-        // but let's just show the error bound and total for the top item as the 'answer' for now, 
-        // since the pure frequency API doesn't return the exact frequency value in this version, 
-        // it returns the score and error bounds.
-        // Instead, we will use the MG count as the estimated frequency for the CMS card display,
-        // and show the CMS specific error bounds.
-        setText('ansCmsVal', fmt(hh[0][1]));
-        setText('ansCmsErr', `Error bound: ±${fmt(data.cms_error_bound)}`);
+        const freqVal = data.estimated_frequency != null ? data.estimated_frequency : hh[0][1];
+        setText('ansCmsVal', fmt(freqVal, 0));
+        setText('ansCmsErr', `Error bound: ±${fmt(data.cms_error_bound)} (${data.rpc_live ? 'live RPC' : 'cached'})`);
       }
     } catch (_) {}
   } else {
@@ -231,7 +224,7 @@ async function updateRouter() {
   } catch (_) {}
 }
 
-// ── Controller log ────────────────────────────────────────
+// ── Controller log & RL stats ─────────────────────────────
 async function updateCtrlLog() {
   try {
     const data = await (await fetch('/metrics/controller-log?n=25')).json();
@@ -244,6 +237,40 @@ async function updateCtrlLog() {
         <span class="log-ts">${fmtTs(d.ts)}</span>
         <span class="log-wid">${d.worker_id}</span>${d.message}
       </div>`).join('');
+  } catch (_) {}
+}
+
+async function updateCtrlStats() {
+  try {
+    const s = await (await fetch('/metrics/controller-stats')).json();
+    setText('rlSteps',  s.steps ?? 0);
+    setText('rlEps',    s.epsilon != null ? Number(s.epsilon).toFixed(2) : '—');
+    setText('rlReward', s.avg_recent_reward != null ? Number(s.avg_recent_reward).toFixed(2) : '—');
+    setText('rlDrifts', s.drift_events ?? 0);
+    const rlBtn = document.getElementById('modeBtnRl');
+    const linucbBtn = document.getElementById('modeBtnLinucb');
+    const ruleBtn = document.getElementById('modeBtnRule');
+    if (rlBtn && linucbBtn && ruleBtn && s.mode) {
+      rlBtn.classList.toggle('active', s.mode === 'rl');
+      linucbBtn.classList.toggle('active', s.mode === 'linucb');
+      ruleBtn.classList.toggle('active', s.mode === 'rule');
+    }
+  } catch (_) {}
+}
+
+async function setCtrlMode(mode, btn) {
+  try {
+    const res = await fetch('/control/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    });
+    if (res.ok) {
+      document.querySelectorAll('#ctrlModeTabs .tab').forEach(b => b.classList.remove('active'));
+      if (btn) btn.classList.add('active');
+      await updateCtrlStats();
+      await updateCtrlLog();
+    }
   } catch (_) {}
 }
 
@@ -325,6 +352,7 @@ async function poll() {
   } catch (_) { setStatus(false); }
   await updateRouter();
   await updateCtrlLog();
+  await updateCtrlStats();
 }
 
 // ── Helper ────────────────────────────────────────────────

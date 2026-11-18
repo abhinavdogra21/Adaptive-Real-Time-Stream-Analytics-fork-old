@@ -221,6 +221,17 @@
       <div class="card">
         <div class="card-header">
           <div class="card-title">Controller Decisions</div>
+          <div class="tab-group" id="ctrlModeTabs">
+            <button class="tab active" id="modeBtnRl" onclick="setCtrlMode('rl',this)">Q-Learn</button>
+            <button class="tab" id="modeBtnLinucb" onclick="setCtrlMode('linucb',this)">LinUCB</button>
+            <button class="tab" id="modeBtnRule" onclick="setCtrlMode('rule',this)">Rule</button>
+          </div>
+        </div>
+        <div class="router-weights" id="rlStatsBar" style="margin-bottom:8px;">
+          <span>steps=<b id="rlSteps">0</b></span>
+          <span>ε=<b id="rlEps">—</b></span>
+          <span>R̄=<b id="rlReward">—</b></span>
+          <span>drifts=<b id="rlDrifts">0</b></span>
           <span class="badge" id="ctrlLogCount">0 events</span>
         </div>
         <div class="log-box" id="ctrlLog">
@@ -302,10 +313,10 @@
         <div class="algo-params">k candidates &nbsp;·&nbsp; window=10,000 &nbsp;·&nbsp; O(k)</div>
       </div>
       <div class="algo-card">
-        <div class="algo-name">Adaptive Controller</div>
-        <div class="algo-desc">Rule-based loop every 5 s. Trades accuracy for latency/memory by switching templates.</div>
-        <code class="algo-eq">min α·Lat + β·Mem + γ·Err</code>
-        <div class="algo-params">P99&gt;200ms → downgrade &nbsp;·&nbsp; err&gt;5% → upgrade</div>
+        <div class="algo-name">Adaptive RL Controller</div>
+        <div class="algo-desc">Online Tabular Q-Learning (108 states) + L1 drift detection. Learns latency/error/memory Pareto policy.</div>
+        <code class="algo-eq">Q(s,a) ← Q + α[r + γ max Q(s′,a′) − Q]</code>
+        <div class="algo-params">ε-greedy decay &nbsp;·&nbsp; Live RL / Rule toggle</div>
       </div>
     </section>
 

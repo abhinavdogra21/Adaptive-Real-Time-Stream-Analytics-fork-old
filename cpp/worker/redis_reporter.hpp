@@ -114,11 +114,20 @@ public:
 
         // SET with 30-second expiry, same as store.py
         redis_.setex(key, std::chrono::seconds(30), payload.dump());
+        // Register worker in global discovery set (matches StateStore._WORKERS_SET)
+        redis_.sadd("btp:workers", m.worker_id);
 
-        // Maintain latency history list
+        // Maintain latency history list (matches Python rpush + ltrim(-60, -1))
         const std::string hist_key = "worker:" + m.worker_id + ":latency_history";
-        redis_.lpush(hist_key, std::to_string(m.p99_latency_ms));
-        redis_.ltrim(hist_key, 0, 299);  // keep last 300 samples
+        redis_.rpush(hist_key, std::to_string(m.p99_latency_ms));
+        redis_.ltrim(hist_key, -60, -1);
+        redis_.expire(hist_key, std::chrono::seconds(120));
+    }
+
+    // Send a one-shot RPC reply back to the API via Redis list
+    void send_rpc_reply(const std::string& reply_key, const json& payload) {
+        redis_.rpush(reply_key, payload.dump());
+        redis_.expire(reply_key, std::chrono::seconds(10));
     }
 
 private:

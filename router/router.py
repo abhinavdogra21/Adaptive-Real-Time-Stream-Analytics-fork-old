@@ -50,8 +50,14 @@ class LoadAwareRouter:
     the best worker_id; the API then reads sketch state from that worker.
     """
 
-    def __init__(self):
-        self.store = StateStore()
+    def __init__(self, store: Optional[StateStore] = None):
+        self._store = store
+
+    @property
+    def store(self) -> StateStore:
+        if self._store is None:
+            self._store = StateStore()
+        return self._store
 
     # ------------------------------------------------------------------
     # Query types → accuracy and latency SLA defaults
@@ -86,7 +92,10 @@ class LoadAwareRouter:
         """
         template    = worker_metrics.get("template", "medium")
         capability  = CAPABILITY_SCORES.get(template, 0.65)
-        p95_ms      = max(worker_metrics.get("p99_latency_ms", 1.0), 0.001)
+        raw_lat     = worker_metrics.get("p95_latency_ms")
+        if raw_lat is None:
+            raw_lat = worker_metrics.get("p99_latency_ms", 1.0)
+        p95_ms      = max(raw_lat, 0.001)
         memory_frac = worker_metrics.get("memory_percent", 0.0) / 100.0
         alpha_q     = max(alpha_q, 1e-6)
         latency_sla = max(latency_sla_ms, 1.0)

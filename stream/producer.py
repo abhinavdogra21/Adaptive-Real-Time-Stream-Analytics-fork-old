@@ -13,6 +13,7 @@ import math
 import os
 import random
 import time
+import zlib
 
 from dotenv import load_dotenv
 from kafka import KafkaProducer
@@ -80,9 +81,11 @@ class StreamProducer:
         n_items: int = 10_000,
         zipf_s: float = 1.2,
         shift_interval_sec: float = 0,
+        partitions: int = 1,
     ):
         self.topic = topic
         self.shift_interval_sec = shift_interval_sec
+        self.partitions = max(1, partitions)
         self.sampler = ZipfSampler(n=n_items, s=zipf_s)
         self._connect(bootstrap_servers)
 
@@ -131,11 +134,17 @@ class StreamProducer:
                     print(f"\n[Producer] ⚠️ CONCEPT DRIFT: Distribution shifted! "
                           f"New top item is item_{new_offset + 1}\n")
 
+                key = self.sampler.sample()
+                part_id = (zlib.crc32(key.encode("utf-8")) & 0xFFFFFFFF) % self.partitions
                 event = {
-                    "key": self.sampler.sample(),
+                    "key": key,
                     "ts": time.time(),
+                    "partition": part_id,
                 }
-                self.producer.send(self.topic, event)
+                if self.partitions > 1:
+                    self.producer.send(self.topic, key=key.encode("utf-8"), value=event, partition=part_id)
+                else:
+                    self.producer.send(self.topic, key=key.encode("utf-8"), value=event)
                 sent += 1
 
                 if sent % 10_000 == 0:
@@ -160,9 +169,15 @@ if __name__ == "__main__":
     parser.add_argument("--items",    type=int,   default=10000, help="Vocabulary size")
     parser.add_argument("--duration", type=float, default=0,     help="Duration in seconds (0 = infinite)")
     parser.add_argument("--shift-interval", type=float, default=0, help="Shift distribution every X seconds (concept drift)")
+    parser.add_argument("--partitions", type=int, default=1,     help="Number of Kafka partitions to distribute stream across")
     args = parser.parse_args()
 
-    producer = StreamProducer(n_items=args.items, zipf_s=args.zipf, shift_interval_sec=args.shift_interval)
+    producer = StreamProducer(
+        n_items=args.items,
+        zipf_s=args.zipf,
+        shift_interval_sec=args.shift_interval,
+        partitions=args.partitions,
+    )
     producer.run(
         rate=args.rate,
         duration_sec=args.duration if args.duration > 0 else float("inf"),

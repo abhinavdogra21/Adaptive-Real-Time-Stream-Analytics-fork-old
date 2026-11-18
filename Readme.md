@@ -10,7 +10,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Kafka](https://img.shields.io/badge/Kafka-7.5.0-231F20?logo=apachekafka&logoColor=white)](https://kafka.apache.org)
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white)](https://redis.io)
-[![Tests](https://img.shields.io/badge/Tests-28%20passed-22c55e?logo=pytest&logoColor=white)](#running-tests)
+[![Tests](https://img.shields.io/badge/Tests-49%20passed-22c55e?logo=pytest&logoColor=white)](#running-tests)
 [![Future Scope](https://img.shields.io/badge/Research-Future%20Scope-black?logo=gitbook&logoColor=white)](futurescope.md)
 
 </div>
@@ -136,20 +136,15 @@ Items surviving this process appear more than `N/k` times. Error ≤ `N/k`.
 
 ---
 
-### Adaptive Controller
+### Adaptive Controller (Phase 2 — Online Q-Learning RL + LinUCB Bandit + Rule-Based)
 
-Runs as a **background asyncio task** in the API server, triggered every `CONTROLLER_INTERVAL_SEC` seconds (default: 5 s).
+Runs as a **background asyncio task** in the API server, triggered every `CONTROLLER_INTERVAL_SEC` seconds (default: 5 s). Supports three live-switchable modes (`POST /control/mode` or directly on the dashboard):
 
-It reads metrics for each registered worker from Redis and applies these rules **in order**:
+- **`rl` (Default — Online Tabular Q-Learning):** Models each worker as a 108-state MDP `(latency_bin [4 levels incl. approaching-SLA], memory_bin [3], empirical_error_bin [3], template [3])`, optimizes a composite SLA + empirical-error + anti-flapping reward via online TD(0) Bellman updates, persists its learned Q-table (`controller/q_table.json`), and detects heavy-hitter concept drift via L1 Total Variation Distance.
+- **`linucb` (Continuous-Feature Contextual Bandit):** Disjoint ridge-regression LinUCB over continuous 6D worker telemetry vectors with UCB exploration.
+- **`rule` (Phase 1 Baseline):** Fixed-threshold heuristic rules using real empirical WAPE CMS error.
 
-```
-if   P99 latency > LATENCY_HIGH_MS:   → reduce_precision(worker)   [downgrade template]
-elif CMS error > ERROR_HIGH
-     AND memory is available:          → increase_precision(worker)  [upgrade template]
-elif memory usage > MEMORY_HIGH_PERCENT: → offload_state(worker)    [shrink MG window / reduce w]
-```
-
-The controller writes commands back to Redis (`worker:{id}:cmd`). Workers poll this key and hot-swap their sketch parameters without dropping events.
+Commands are published over Redis pub/sub (`ctrl:commands:{id}`). Workers apply new templates **without data loss** (power-of-2 CMS modular folding, HLL union-preserving precision change, in-place Misra–Gries resize).
 
 ---
 
@@ -589,17 +584,39 @@ Config                                          P99 (ms)   Mem (MB)    HLL err
 
 ## Running Tests
 
-### Python Unit Tests (no Kafka/Redis needed)
+### Python Unit Tests (100% Offline — No Kafka/Redis needed)
 
 ```bash
 pytest tests/ -v
 ```
 
-This runs **28 tests** covering:
-- **8 Router tests** — scoring formula, node ranking, edge cases
-- **6 CMS tests** — error bounds, no-undercount guarantee, memory
-- **7 HLL tests** — cardinality accuracy, duplicate handling, precision levels
-- **7 MG tests** — heavy hitter detection, window eviction, sorting
+This runs **49 comprehensive tests** in `<0.5 seconds`:
+- **6 CMS tests** — error bounds, no-undercount guarantee, memory calculation
+- **7 HLL tests** — cardinality estimation, duplicate handling, precision bounds
+- **7 MG tests** — heavy hitter detection, sliding-window eviction, sorting
+- **8 Router tests** — utility scoring formula, node ranking, offline mock safety
+- **5 Phase 1 Sketch Fix tests** — Conservative Updating, zero-loss migration, decay, HLL/MG resize
+- **8 Phase 2 ML Agent tests** — Q-Learning convergence, LinUCB learning, L1 TVD concept drift, Q-table persistence
+- **8 Scatter-Gather & Monoid tests** — Monoid laws (associativity, identity, semilattice idempotence, space-saving merge), topology election, straggler hedging mitigation, unhedged fallback
+
+### Phase 2 Evaluation & Publication Figures
+
+```bash
+# 1. Run 5-configuration multi-regime simulation (40,000 events)
+python3 scripts/run_simulation.py
+
+# 2. Run Hedged Scatter-Gather benchmark under stragglers (1,500 queries, 4 partitions)
+python3 scripts/run_scatter_gather_benchmark.py
+
+# 3. Generate all 4 publication-quality 300 DPI figures
+python3 scripts/plot_results.py
+```
+
+Generated figures are saved directly to `LNMIIT BTP Report Template/Figures/Phase2/`:
+- `fig1_rl_convergence.png` — Q-Learning vs LinUCB online policy convergence curve
+- `fig2_controller_comparison.png` — 5-configuration comparative benchmark (Reward, SLA, Error, Flapping)
+- `fig3_cu_cms_comparison.png` — Standard CMS vs Conservative-Update CMS under Zipf skew
+- `fig4_hedged_scatter_gather.png` — Tail-latency CDF and percentile breakdown under 5% worker stragglers
 
 ### C++ Unit Tests (after building)
 
@@ -638,20 +655,25 @@ All endpoints return JSON. Interactive docs: **[http://localhost:8000/docs](http
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/query/frequency?key=X` | CMS frequency estimate for key X |
-| `GET` | `/query/cardinality` | HLL distinct count estimate |
-| `GET` | `/query/heavy-hitters?n=10` | Top-N Misra–Gries heavy hitters |
+| `GET` | `/query/frequency?key=X` | Routed live CMS frequency estimate for key X |
+| `GET` | `/query/cardinality` | Routed HLL distinct count estimate |
+| `GET` | `/query/heavy-hitters?n=10` | Routed Top-N Misra–Gries heavy hitters |
+| `GET` | `/query/distributed/frequency?key=X` | Distributed scatter-gather CMS frequency across all partitions (Additive Monoid Merge ⊕) with replica hedging |
+| `GET` | `/query/distributed/cardinality` | Distributed scatter-gather HLL cardinality across all partitions (Coordinate-wise Max ⊕) with replica hedging |
+| `GET` | `/query/distributed/heavy-hitters?n=10` | Distributed scatter-gather Misra-Gries heavy hitters (Space-Saving Monoid Merge ⊕) with replica hedging |
 
-All query endpoints route through the **load-aware router** and include routing metadata in the response.
+All routed query endpoints leverage the **load-aware router**, and distributed endpoints orchestrate asynchronous scatter-gather with P95 straggler hedging across partition replicas.
 
 ### Metrics Endpoints
 
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/metrics/cluster` | Live health metrics for all workers |
+| `GET` | `/metrics/partitions` | Active partition topology, designated primaries, and hot replicas |
 | `GET` | `/metrics/sketches` | Current sketch parameters per worker |
 | `GET` | `/metrics/router?q=frequency` | Router utility scores per node |
 | `GET` | `/metrics/controller-log` | Recent adaptive controller decisions |
+| `GET` | `/metrics/controller-stats` | Live RL/LinUCB telemetry (mode, steps, ε, avg reward, drifts) |
 | `GET` | `/metrics/query-log` | Recent query routing decisions |
 
 ### Control Endpoints
@@ -659,6 +681,7 @@ All query endpoints route through the **load-aware router** and include routing 
 | Method | Endpoint | Body | Description |
 |---|---|---|---|
 | `POST` | `/control/set-params` | `{"worker_id": "w0", "template": "high"}` | Force a precision template on a worker |
+| `POST` | `/control/mode` | `{"mode": "rl" \| "linucb" \| "rule"}` | Switch adaptive controller algorithm live |
 | `GET`  | `/health` | — | Liveness probe |
 
 ---
